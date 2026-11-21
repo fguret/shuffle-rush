@@ -1,0 +1,50 @@
+html,
+body {
+  margin: 0;
+  background: #1e1f22;
+}
+
+.harness-bar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: #111214;
+  color: #d6d8dc;
+  font: 13px/1.4 'Segoe UI', Arial, sans-serif;
+}
+
+.harness-bar button {
+  padding: 4px 10px;
+  border: 1px solid #4a4d52;
+  border-radius: 4px;
+  background: transparent;
+  color: #d6d8dc;
+  font: inherit;
+  cursor: pointer;
+}
+
+.harness-bar button.is-active {
+  background: #2f8a36;
+  border-color: #2f8a36;
+  color: #fff;
+}
+
+.harness-canvas {
+  padding: 24px 0;
+}
+
+.harness-section {
+  margin: 0 auto;
+  background: #fff;
+}
+
+@media (max-width: 640px) {
+  .harness-canvas {
+    padding: 0;
+  }
+}
