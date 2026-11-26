@@ -1,0 +1,383 @@
+import * as React from 'react';
+import { createRoot, Root } from 'react-dom/client';
+import { Version } from '@microsoft/sp-core-library';
+import {
+  IPropertyPaneConfiguration,
+  IPropertyPaneDropdownOption,
+  PropertyPaneButton,
+  PropertyPaneButtonType,
+  PropertyPaneDropdown,
+  PropertyPaneSlider,
+  PropertyPaneTextField,
+  PropertyPaneToggle
+} from '@microsoft/sp-property-pane';
+import { BaseClientSideWebPart } from '@microsoft/sp-webpart-base';
+import { SPHttpClient, SPHttpClientResponse } from '@microsoft/sp-http';
+import { SPComponentLoader } from '@microsoft/sp-loader';
+
+import * as strings from 'AssuranceLearningCalendarWebPartStrings';
+import AssuranceLearningCalendar, { DEFAULT_SIDE_GUTTER } from './components/AssuranceLearningCalendar';
+import { IAssuranceLearningCalendarProps } from './components/IAssuranceLearningCalendarProps';
+import { ICourseService } from './services/ICourseService';
+import { LocalCourseService } from './services/LocalCourseService';
+import { DEFAULT_LIST_NAME, SharePointCourseService } from './services/SharePointCourseService';
+import {
+  DEFAULT_ADMIN_LIST_NAME,
+  DEFAULT_VISITS_LIST_NAME,
+  IAdminService,
+  IVisitService
+} from './services/IAdminService';
+import { LocalAdminService, LocalVisitService } from './services/LocalAdminService';
+import { SharePointAdminService, SharePointVisitService } from './services/SharePointAdminService';
+import { ISPRest } from './services/SPRest';
+import { clearStored } from './utils/localStore';
+import { ICurrentUser } from './models/IAdmin';
+
+export type DataSource = 'Local' | 'SharePoint';
+/** Where the admin users come from: 'Same' follows the data source. */
+export type AdminSource = 'Same' | DataSource;
+
+export interface IAssuranceLearningCalendarWebPartProps {
+  dataSource: DataSource;
+  listName: string;
+  /** Optional absolute URL of the site holding the list; empty = current site. */
+  siteUrl: string;
+  title: string;
+  questionsLinkText: string;
+  questionsLinkUrl: string;
+  contactEmail: string;
+  heroImageUrl: string;
+  tableHeight: number;
+  /** Same look on every screen resolution (page scaled to the screen width; browser zoom still zooms). */
+  fitToWidth: boolean;
+  /** Side bar width on each side at 100% zoom, % of the screen width. */
+  sideGutter: number;
+  /** Side bar colour (any CSS colour); empty = transparent. */
+  gutterColor: string;
+  /** Admin users: same as the data source (default), sample users, or the SharePoint list. */
+  adminSource: AdminSource;
+  /** Admin access list title; empty = AssuranceLearningCalendarAdmins. */
+  adminListName: string;
+  /** Visit tracking list title; empty = AssuranceLearningCalendarVisits. */
+  visitsListName: string;
+  /** Record who visits the calendar and for how long. */
+  trackVisits: boolean;
+}
+
+interface IServices {
+  courses: ICourseService;
+  admins: IAdminService;
+  visits: IVisitService;
+}
+
+const FONT_URL: string = 'https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600;700;800&display=swap';
+
+export default class AssuranceLearningCalendarWebPart extends BaseClientSideWebPart<IAssuranceLearningCalendarWebPartProps> {
+  private _root: Root | undefined;
+  private _services: IServices | undefined;
+  private _serviceKey: string = '';
+  /** Bumped by Reset sample data, so new local services (and a reload of the data) are made. */
+  private _resetCount: number = 0;
+  /** Created once, so the component sees the same object on every render. */
+  private _currentUser: ICurrentUser | undefined;
+
+  protected onInit(): Promise<void> {
+    try {
+      SPComponentLoader.loadCss(FONT_URL);
+    } catch {
+      // Falls back to Segoe UI.
+    }
+    const user = this.context.pageContext.user;
+    const legacy = this.context.pageContext.legacyPageContext as { isSiteAdmin?: boolean } | undefined;
+    this._currentUser = {
+      displayName: user.displayName,
+      email: (user.email || user.loginName || '').toLowerCase(),
+      isSiteAdmin: !!(legacy && legacy.isSiteAdmin)
+    };
+    return super.onInit();
+  }
+
+  public render(): void {
+    const p: IAssuranceLearningCalendarWebPartProps = this.properties;
+    const contactEmail: string = p.contactEmail || 'usaalearning2@deloitte.com';
+    const services: IServices = this._getServices();
+    const isSharePoint: boolean = p.dataSource === 'SharePoint';
+
+    const element: React.ReactElement<IAssuranceLearningCalendarProps> = React.createElement(
+      AssuranceLearningCalendar,
+      {
+        dataService: services.courses,
+        dataKey: this._serviceKey,
+        title: p.title || 'Assurance Virtual Learning Enrollment Calendar',
+        questionsLinkText: p.questionsLinkText || 'Audit & Assurance Learning',
+        questionsLinkUrl: p.questionsLinkUrl || `mailto:${contactEmail}`,
+        contactEmail,
+        heroImageUrl: p.heroImageUrl || undefined,
+        tableHeight: p.tableHeight || 440,
+        // Older instances have no value yet: treat that as on.
+        fitToWidth: p.fitToWidth !== false,
+        sideGutter: typeof p.sideGutter === 'number' ? p.sideGutter : DEFAULT_SIDE_GUTTER,
+        gutterColor: (p.gutterColor || '').trim(),
+        currentUser: this._currentUser,
+        adminService: services.admins,
+        visitService: services.visits,
+        // Older instances have no value yet: treat that as on.
+        trackVisits: p.trackVisits !== false,
+        importTargetLabel: isSharePoint
+          ? `the "${(p.listName || DEFAULT_LIST_NAME).trim()}" SharePoint list`
+          : 'the local sample list (kept in this browser until Reset sample data in the web part settings)'
+      }
+    );
+
+    if (!this._root) {
+      this._root = createRoot(this.domElement);
+    }
+    this._root.render(element);
+  }
+
+  protected onDispose(): void {
+    if (this._root) {
+      this._root.unmount();
+      this._root = undefined;
+    }
+  }
+
+  protected get dataVersion(): Version {
+    return Version.parse('1.0');
+  }
+
+  /** True when the admin users come from the SharePoint list. */
+  private get _adminsFromSharePoint(): boolean {
+    const source: AdminSource = this.properties.adminSource || 'Same';
+    return (source === 'Same' ? this.properties.dataSource : source) === 'SharePoint';
+  }
+
+  /**
+   * Course, admin and visit services (made again when a source or list changes).
+   * Courses and visits follow the data source; admin users follow the Admin users setting.
+   */
+  private _getServices(): IServices {
+    const p: IAssuranceLearningCalendarWebPartProps = this.properties;
+    const webUrl: string = (p.siteUrl || this.context.pageContext.web.absoluteUrl).trim();
+    const listName: string = (p.listName || DEFAULT_LIST_NAME).trim();
+    const adminList: string = (p.adminListName || DEFAULT_ADMIN_LIST_NAME).trim();
+    const visitsList: string = (p.visitsListName || DEFAULT_VISITS_LIST_NAME).trim();
+    const coursesFromSharePoint: boolean = p.dataSource === 'SharePoint';
+    const adminsFromSharePoint: boolean = this._adminsFromSharePoint;
+    const key: string = [
+      coursesFromSharePoint ? `sp|${webUrl}|${listName}|${visitsList}` : `local#${this._resetCount}`,
+      adminsFromSharePoint ? `sp|${webUrl}|${adminList}` : `local#${this._resetCount}`
+    ].join('||');
+
+    if (!this._services || key !== this._serviceKey) {
+      this._serviceKey = key;
+      this._services = {
+        courses: coursesFromSharePoint
+          ? new SharePointCourseService(this._rest, webUrl, listName)
+          : new LocalCourseService(150, this._localKeys[0]),
+        // Sample admin users: the signed-in user is the Super Admin.
+        admins: adminsFromSharePoint
+          ? new SharePointAdminService(this._rest, webUrl, adminList)
+          : new LocalAdminService(this._currentUser, 400, this._localKeys[1]),
+        visits: coursesFromSharePoint
+          ? new SharePointVisitService(this._rest, webUrl, visitsList)
+          : new LocalVisitService(this._localKeys[2])
+      };
+    }
+    return this._services;
+  }
+
+  /**
+   * Browser storage for the Local sample data (events, admin users, visits) of this site, so changes made
+   * in the admin panel survive a reload of the page or workbench. Each browser keeps its own copy.
+   */
+  private get _localKeys(): string[] {
+    const site: string = this.context.pageContext.web.absoluteUrl;
+    return ['courses', 'admins', 'visits'].map((name) => `alc-local-${name}|${site}`);
+  }
+
+  /** Puts back the original sample data (Reset sample data button in the settings). */
+  private _resetLocalData(): string {
+    clearStored(this._localKeys);
+    this._resetCount++;
+    this.render();
+    return '';
+  }
+
+  /** SharePoint REST calls for the services (reads, and writes with odata=nometadata). */
+  private _rest: ISPRest = {
+    get: (url: string): Promise<unknown> => this._fetchJson(url),
+    post: async (
+      url: string,
+      body: unknown,
+      headers?: Record<string, string>,
+      keepalive?: boolean
+    ): Promise<unknown> => {
+      const response: SPHttpClientResponse = await this.context.spHttpClient.post(url, SPHttpClient.configurations.v1, {
+        headers: {
+          Accept: 'application/json;odata=nometadata',
+          'Content-Type': 'application/json;odata=nometadata',
+          'odata-version': '',
+          ...(headers || {})
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        keepalive
+      });
+      if (!response.ok) {
+        throw await this._readError(response);
+      }
+      const text: string = response.status === 204 ? '' : await response.text();
+      return text ? JSON.parse(text) : undefined;
+    }
+  };
+
+  private _fetchJson = async (url: string): Promise<unknown> => {
+    const response: SPHttpClientResponse = await this.context.spHttpClient.get(url, SPHttpClient.configurations.v1);
+    if (!response.ok) {
+      throw await this._readError(response);
+    }
+    return response.json();
+  };
+
+  /** "404 List 'X' does not exist ..." from a failed response. */
+  private async _readError(response: SPHttpClientResponse): Promise<Error> {
+    let detail: string = response.statusText;
+    try {
+      const body = (await response.json()) as {
+        error?: { message?: string | { value?: string } };
+        'odata.error'?: { message?: { value?: string } };
+      };
+      const raw =
+        (body && body.error && body.error.message) || (body && body['odata.error'] && body['odata.error'].message);
+      const text: string | undefined = typeof raw === 'string' ? raw : raw && raw.value;
+      if (text) {
+        detail = text;
+      }
+    } catch {
+      // ignore body parse errors
+    }
+    return new Error(`${response.status} ${detail}`);
+  }
+
+  protected getPropertyPaneConfiguration(): IPropertyPaneConfiguration {
+    const sources: IPropertyPaneDropdownOption[] = [
+      { key: 'Local', text: strings.DataSourceLocal },
+      { key: 'SharePoint', text: strings.DataSourceSharePoint }
+    ];
+    const isSharePoint: boolean = this.properties.dataSource === 'SharePoint';
+    const adminSources: IPropertyPaneDropdownOption[] = [
+      { key: 'Same', text: strings.AdminSourceSame },
+      { key: 'Local', text: strings.AdminSourceLocal },
+      { key: 'SharePoint', text: strings.AdminSourceSharePoint }
+    ];
+
+    return {
+      pages: [
+        {
+          header: { description: strings.PropertyPaneDescription },
+          groups: [
+            {
+              groupName: strings.DataGroupName,
+              groupFields: [
+                PropertyPaneDropdown('dataSource', { label: strings.DataSourceFieldLabel, options: sources }),
+                PropertyPaneTextField('listName', {
+                  label: strings.ListNameFieldLabel,
+                  placeholder: DEFAULT_LIST_NAME,
+                  disabled: !isSharePoint
+                }),
+                PropertyPaneTextField('siteUrl', {
+                  label: strings.SiteUrlFieldLabel,
+                  placeholder: strings.SiteUrlPlaceholder,
+                  disabled: !isSharePoint
+                }),
+                // Local sample data is kept in this browser; this puts the original sample back.
+                PropertyPaneButton('resetLocalData', {
+                  text: strings.ResetLocalDataButton,
+                  buttonType: PropertyPaneButtonType.Normal,
+                  icon: 'Refresh',
+                  disabled: isSharePoint && this._adminsFromSharePoint,
+                  onClick: () => this._resetLocalData()
+                })
+              ]
+            },
+            {
+              groupName: strings.DisplayGroupName,
+              groupFields: [
+                PropertyPaneTextField('title', { label: strings.TitleFieldLabel }),
+                PropertyPaneTextField('questionsLinkText', { label: strings.QuestionsLinkTextFieldLabel }),
+                PropertyPaneTextField('questionsLinkUrl', {
+                  label: strings.QuestionsLinkUrlFieldLabel,
+                  placeholder: 'mailto:… or https://…'
+                }),
+                PropertyPaneTextField('contactEmail', { label: strings.ContactEmailFieldLabel }),
+                PropertyPaneTextField('heroImageUrl', {
+                  label: strings.HeroImageUrlFieldLabel,
+                  placeholder: strings.HeroImageUrlPlaceholder
+                }),
+                PropertyPaneSlider('tableHeight', {
+                  label: strings.TableHeightFieldLabel,
+                  min: 240,
+                  max: 1200,
+                  step: 20,
+                  showValue: true
+                })
+              ]
+            },
+            {
+              groupName: strings.AdminGroupName,
+              groupFields: [
+                PropertyPaneDropdown('adminSource', {
+                  label: strings.AdminSourceFieldLabel,
+                  options: adminSources,
+                  selectedKey: this.properties.adminSource || 'Same'
+                }),
+                PropertyPaneTextField('adminListName', {
+                  label: strings.AdminListNameFieldLabel,
+                  placeholder: DEFAULT_ADMIN_LIST_NAME,
+                  disabled: !this._adminsFromSharePoint
+                }),
+                PropertyPaneTextField('visitsListName', {
+                  label: strings.VisitsListNameFieldLabel,
+                  placeholder: DEFAULT_VISITS_LIST_NAME,
+                  disabled: !isSharePoint
+                }),
+                PropertyPaneToggle('trackVisits', {
+                  label: strings.TrackVisitsFieldLabel,
+                  onText: strings.TrackVisitsOn,
+                  offText: strings.TrackVisitsOff,
+                  checked: this.properties.trackVisits !== false
+                })
+              ]
+            },
+            {
+              groupName: strings.LayoutGroupName,
+              groupFields: [
+                PropertyPaneToggle('fitToWidth', {
+                  label: strings.FitToWidthFieldLabel,
+                  onText: strings.FitToWidthOn,
+                  offText: strings.FitToWidthOff,
+                  checked: this.properties.fitToWidth !== false
+                }),
+                PropertyPaneSlider('sideGutter', {
+                  label: strings.SideGutterFieldLabel,
+                  min: 0,
+                  max: 20,
+                  step: 1,
+                  showValue: true,
+                  value:
+                    typeof this.properties.sideGutter === 'number' ? this.properties.sideGutter : DEFAULT_SIDE_GUTTER,
+                  disabled: this.properties.fitToWidth === false
+                }),
+                PropertyPaneTextField('gutterColor', {
+                  label: strings.GutterColorFieldLabel,
+                  placeholder: strings.GutterColorPlaceholder,
+                  disabled: this.properties.fitToWidth === false
+                })
+              ]
+            }
+          ]
+        }
+      ]
+    };
+  }
+}
